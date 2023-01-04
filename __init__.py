@@ -14,10 +14,12 @@ from functools import partial
 
 from zim.notebook import Path
 from zim.notebook.index.base import TreeModelMixinBase
+from zim.notebook.index.base import MyTreeIter
 from zim.notebook.index.pages import PagesTreeModelMixin, PageIndexRecord, IndexNotFoundError, IS_PAGE
 
 from zim.plugins import PluginClass
 from zim.actions import PRIMARY_MODIFIER_MASK
+from zim.actions import toggle_action
 
 from zim.gui.pageview import PageViewExtension
 from zim.gui.widgets import BrowserTreeView, ScrolledWindow, \
@@ -29,7 +31,8 @@ from zim.gui.uiactions import UIActions, PAGE_EDIT_ACTIONS, PAGE_ROOT_ACTIONS
 
 import zim.gui.clipboard
 
-logger = logging.getLogger('zim.gui.pageindex')
+logger = logging.getLogger('zim.gui.expageindex')
+
 
 
 NAME_COL = 0  #: Column with short page name (page.basename)
@@ -45,12 +48,13 @@ KEYVAL_C = Gdk.unicode_to_keyval(ord('c'))
 KEYVAL_L = Gdk.unicode_to_keyval(ord('l'))
 
 
-class PageIndexPlugin(PluginClass):
+class ExPageIndexPlugin(PluginClass):
 
 	plugin_info = {
-		'name': _('Page Index'), # T: plugin name
+		'name': _('Existing Page Index'), # T: plugin name
 		'description': _('''\
 This plugin adds the page index pane to the main window.
+Does not show placeholder pages.
 '''), # T: plugin description
 		'author': 'Jaap Karssenberg',
 		'help': 'Plugins:PageIndex',
@@ -72,7 +76,8 @@ class PageIndexPageViewExtension(PageViewExtension):
 	def __init__(self, plugin, pageview):
 		PageViewExtension.__init__(self, plugin, pageview)
 		index = pageview.notebook.index
-		model = PageTreeStore(index)
+		model = ExistingPageTreeStore(index)
+		self.pageview = pageview
 		self.treeview = PageTreeView(pageview.notebook, self.navigation)
 		self.treeview.set_model(model)
 		self.widget = PageIndexWidget(self.treeview)
@@ -124,6 +129,16 @@ class PageIndexPageViewExtension(PageViewExtension):
 		'''
 		self.treeview.disconnect_index()
 		model = PageTreeStore(self.pageview.notebook.index)
+		self.treeview.set_model(model)
+
+	@toggle_action(_('Show inexisting pages')) # T: menu item
+	def toggle_existing_filter(self, active):
+		index = self.pageview.notebook.index
+		if active:
+			model = PageTreeStore(index)
+		else:
+			model = ExistingPageTreeStore(index)
+
 		self.treeview.set_model(model)
 
 
@@ -348,11 +363,130 @@ class PageTreeStoreBase(GenericTreeModel, Gtk.TreeDragSource, Gtk.TreeDragDest):
 		else:
 			return None
 
+class ExistingPagesTreeModelMixin(PagesTreeModelMixin):
+        # Filter placeholder out of the tree
+
+
+	def n_children_top(self):
+		if self._MY_ROOT_ID is None:
+			return 0
+		else:
+			return self.db.execute(
+				#'SELECT COUNT(*) FROM pages WHERE parent=?', (self._MY_ROOT_ID,)
+				'SELECT COUNT(*) FROM pages WHERE parent=? AND is_link_placeholder=?', (self._MY_ROOT_ID, False)
+			).fetchone()[0]
+
+	def get_mytreeiter(self, treepath):
+		if self._MY_ROOT_ID is None:
+			return None
+
+		treepath = tuple(treepath) # used to cache
+		if treepath in self.cache:
+			return self.cache[treepath]
+
+		# Find parent
+		parentpath = treepath[:-1]
+		if not parentpath:
+			parent_id = self._MY_ROOT_ID
+		else:
+			parent_iter = self.cache.get(parentpath, None) \
+							or self.get_mytreeiter(parentpath) # recurs
+			if parent_iter:
+				parent_id = parent_iter.row['id']
+			else:
+				return None
+
+		# Now cache a slice at the target level
+		offset = treepath[-1]
+		if self._REVERSE:
+			rows = self.db.execute('''
+				SELECT * FROM pages WHERE parent=? AND is_link_placeholder=?
+				ORDER BY sortkey DESC, name DESC LIMIT 20 OFFSET ?
+				''',
+				(parent_id, False, offset)
+			)
+		else:
+			rows = self.db.execute('''
+				SELECT * FROM pages WHERE parent=? AND is_link_placeholder=?
+				ORDER BY sortkey ASC, name ASC LIMIT 20 OFFSET ?
+				''',
+				(parent_id, False, offset)
+			)
+		for i, row in enumerate(rows):
+			mytreepath = tuple(parentpath) + (offset + i,)
+			if mytreepath not in self.cache:
+				self.cache[mytreepath] = MyTreeIter(
+					Gtk.TreePath(mytreepath),
+					row,
+					row['n_children'],
+					IS_PAGE
+				)
+			else:
+				break # avoid overwriting cache because of ref count
+
+		return self.cache.get(treepath, None)
+
+	def _find_all_pages(self, name, update_cache=True):
+		if self._MY_ROOT_ID is None or \
+			not name.startswith(self._MY_ROOT_NAME_C):
+				return []
+
+		parent_id = self._MY_ROOT_ID
+		names = name[len(self._MY_ROOT_NAME_C):].split(':')
+		treepath = []
+		for i, basename in enumerate(names):
+			# Get treepath
+			name = self._MY_ROOT_NAME_C + ':'.join(names[:i + 1])
+			myrow = self.db.execute(
+				'SELECT * FROM pages WHERE name=?', (name,)
+			).fetchone()
+			if myrow is None:
+				raise IndexNotFoundError
+
+			sortkey = myrow['sortkey']
+			if self._REVERSE:
+				row = self.db.execute('''
+					SELECT COUNT(*) FROM pages
+					WHERE parent=? and (
+						sortkey>? or (sortkey=? and name>?)
+					) AND is_link_placeholder=?''',
+					(parent_id, sortkey, sortkey, name, False)
+				).fetchone()
+			else:
+				row = self.db.execute('''
+					SELECT COUNT(*) FROM pages
+					WHERE parent=? and (
+						sortkey<? or (sortkey=? and name<?)
+					) AND is_link_placeholder=?''',
+					(parent_id, sortkey, sortkey, name, False)
+				).fetchone()
+			treepath.append(row[0])
+			parent_id = myrow['id']
+
+			if update_cache:
+				# Update cache (avoid overwriting because of ref count)
+				mytreepath = tuple(treepath)
+				if mytreepath not in self.cache:
+					myiter = MyTreeIter(
+						Gtk.TreePath(mytreepath),
+						myrow,
+						myrow['n_children'],
+						IS_PAGE
+					)
+					self.cache[mytreepath] = myiter
+
+		return [Gtk.TreePath(treepath)]
 
 class PageTreeStore(PagesTreeModelMixin, PageTreeStoreBase):
 
 	def __init__(self, index, root=None, reverse=False):
 		PagesTreeModelMixin.__init__(self, index, root, reverse)
+		PageTreeStoreBase.__init__(self)
+
+class ExistingPageTreeStore(ExistingPagesTreeModelMixin, PageTreeStoreBase):
+
+	def __init__(self, index, root=None, reverse=False):
+		ExistingPagesTreeModelMixin.__init__(self, index, root, reverse)
 		PageTreeStoreBase.__init__(self)
 
 
@@ -379,7 +513,7 @@ class PageTreeView(BrowserTreeView):
 
 	def __init__(self, notebook, navigation, model=None):
 		BrowserTreeView.__init__(self)
-		self.set_name('zim-pageindex')
+		self.set_name('zim-expageindex')
 		self.notebook = notebook
 		self.navigation = navigation
 
